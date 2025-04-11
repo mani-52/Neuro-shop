@@ -1,0 +1,250 @@
+import sqlite3
+import pandas as pd
+from datetime import datetime
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+
+# ========== Database Setup ==========
+def initialize_database(db_path='ecommerce.db'):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            age INTEGER,
+            gender TEXT,
+            location TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS products (
+            product_id TEXT PRIMARY KEY,
+            category TEXT,
+            price REAL,
+            stock INTEGER,
+            popularity INTEGER DEFAULT 0
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS interactions (
+            interaction_id INTEGER PRIMARY KEY,
+            user_id TEXT,
+            product_id TEXT,
+            action_type TEXT,
+            timestamp DATETIME
+        )
+    ''')
+    
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user ON interactions(user_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_product ON interactions(product_id)')
+    
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES ('user123')")
+    cursor.execute("INSERT OR IGNORE INTO products (product_id, category) VALUES ('prod1', 'electronics')")
+    cursor.execute("INSERT OR IGNORE INTO products (product_id, category) VALUES ('prod2', 'clothing')")
+    
+    conn.commit()
+    conn.close()
+
+initialize_database()
+
+# ========== Agent Classes ==========
+class CustomerAgent:
+    def _init_(self, db_path='ecommerce.db'):
+        self.db_path = db_path
+    
+    def log_interaction(self, user_id, product_id, action_type):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute('''
+                INSERT INTO interactions (user_id, product_id, action_type, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, product_id, action_type, timestamp))
+
+class ProductAgent:
+    def _init_(self, db_path='ecommerce.db'):
+        self.db_path = db_path
+    
+    def update_popularity(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE products
+                SET popularity = (
+                    SELECT COUNT(*) 
+                    FROM interactions 
+                    WHERE products.product_id = interactions.product_id 
+                    AND action_type = 'purchase'
+                )
+            ''')
+    
+    def get_popular_products(self, top_n=5):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT product_id 
+                FROM products 
+                ORDER BY popularity DESC 
+                LIMIT ?
+            ''', (top_n,))
+            return [row[0] for row in cursor.fetchall()]
+
+class RecommendationAgent:
+    def _init_(self, db_path='ecommerce.db'):
+        self.db_path = db_path
+        self.user_item_matrix = defaultdict(dict)
+        self.load_data()
+    
+    def load_data(self):
+        with sqlite3.connect(self.db_path) as conn:
+            interactions = pd.read_sql_query('''
+                SELECT user_id, product_id, COUNT(*) as purchases
+                FROM interactions
+                WHERE action_type = 'purchase'
+                GROUP BY user_id, product_id
+            ''', conn)
+            
+        for _, row in interactions.iterrows():
+            self.user_item_matrix[row['user_id']][row['product_id']] = row['purchases']
+    
+    def content_based_filtering(self, user_id, top_n=5):
+        with sqlite3.connect(self.db_path) as conn:
+            user_history = pd.read_sql_query(f'''
+                SELECT p.category 
+                FROM interactions i
+                JOIN products p ON i.product_id = p.product_id
+                WHERE i.user_id = '{user_id}' AND action_type = 'purchase'
+            ''', conn)
+            
+            products = pd.read_sql_query('SELECT product_id, category FROM products', conn)
+        
+        if user_history.empty:
+            return []
+        
+        tfidf = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = tfidf.fit_transform(products['category'])
+        
+        user_profile = ' '.join(user_history['category'].tolist())
+        user_tfidf = tfidf.transform([user_profile])
+        cosine_sim = cosine_similarity(user_tfidf, tfidf_matrix)
+        
+        sim_scores = sorted(enumerate(cosine_sim[0]), key=lambda x: x[1], reverse=True)
+        return products.iloc[[i[0] for i in sim_scores[:top_n]]]['product_id'].tolist()
+    
+    def hybrid_recommendations(self, user_id, top_n=5):
+        cb_recommendations = self.content_based_filtering(user_id, top_n)
+        
+        target_items = set(self.user_item_matrix.get(user_id, {}).keys())
+        recommendations = defaultdict(float)
+        
+        for other_user, items in self.user_item_matrix.items():
+            if other_user == user_id:
+                continue
+                
+            common = len(target_items & set(items.keys()))
+            total = len(target_items | set(items.keys()))
+            similarity = common / total if total > 0 else 0
+            
+            for item in items:
+                if item not in target_items:
+                    recommendations[item] += similarity * items[item]
+        
+        cf_recommendations = [item[0] for item in sorted(recommendations.items(), 
+                                                       key=lambda x: x[1], 
+                                                       reverse=True)[:top_n]]
+        
+        combined = list(dict.fromkeys(cb_recommendations + cf_recommendations))
+        if not combined:
+            return ProductAgent(self.db_path).get_popular_products(top_n)
+        return combined[:top_n]
+    
+    def evaluate(self, user_id, test_purchases, top_n=5):
+        recommendations = self.hybrid_recommendations(user_id, top_n)
+        hits = len(set(recommendations) & set(test_purchases))
+        return {
+            'precision': hits / top_n,
+            'recall': hits / len(test_purchases) if test_purchases else 0
+        }
+
+# ========== Execute in Colab ==========
+if _name_ == "_main_":
+    customer_agent = CustomerAgent()
+    product_agent = ProductAgent()
+    recommender = RecommendationAgent()
+
+    print("=== Simulating Interactions ===")
+    customer_agent.log_interaction('user123', 'prod1', 'view')
+    customer_agent.log_interaction('user123', 'prod1', 'purchase')
+    customer_agent.log_interaction('user123', 'prod2', 'cart')
+    product_agent.update_popularity()
+
+    print("\n=== Recommendations ===")
+    print("User123:", recommender.hybrid_recommendations('user123'))
+    print("New User:", recommender.hybrid_recommendations('new_user'))
+
+    print("\n=== Adding New Product ===")
+    with sqlite3.connect('ecommerce.db') as conn:
+        # Use INSERT OR IGNORE to avoid the error if 'prod3' already exists
+        conn.execute("INSERT OR IGNORE INTO products (product_id, category) VALUES ('prod3', 'books')")  
+    print("Updated Recommendations:", recommender.hybrid_recommendations('user123'))
+
+    print("\n=== Evaluation ===")
+    test_data = ['prod2']
+    for item in test_data:
+        customer_agent.log_interaction('user123', item, 'purchase')
+    metrics = recommender.evaluate('user123', test_data)
+    print(f"Precision: {metrics['precision']:.2%}, Recall: {metrics['recall']:.2%}")
+def hybrid_recommendations(self, user_id, top_n=5):
+    cb_recommendations = self.content_based_filtering(user_id, top_n)
+    
+    # Get target user's purchased items
+    target_items = set(self.user_item_matrix.get(user_id, {}).keys())  # THIS IS WHERE target_items IS DEFINED
+    
+    recommendations = defaultdict(float)
+    
+    for other_user, items in self.user_item_matrix.items():
+        if other_user == user_id:
+            continue
+            
+        # ========== IMPROVED SIMILARITY CALCULATION ==========
+        # Convert to sets for Jaccard calculation
+        other_user_items = set(items.keys())
+        
+        # Calculate Jaccard similarity
+        intersection = len(target_items & other_user_items)
+        union = len(target_items | other_user_items)
+        similarity = intersection / union if union > 0 else 0
+        # ========== END OF IMPROVED SECTION ==========
+        
+        for item in items:
+            if item not in target_items:
+                recommendations[item] += similarity * items[item]
+    
+    cf_recommendations = [item[0] for item in sorted(recommendations.items(), 
+                                                   key=lambda x: x[1], 
+                                                   reverse=True)[:top_n]]
+    
+    combined = list(dict.fromkeys(cb_recommendations + cf_recommendations))
+    return combined[:top_n] if combined else ProductAgent(self.db_path).get_popular_products(top_n)
+# Test cold-start problem (new user/new item)
+print("New User Recommendations:", recommender.hybrid_recommendations('user999'))  # Should show popular items
+
+# Test empty interactions
+with sqlite3.connect('ecommerce.db') as conn:
+    conn.execute("DELETE FROM interactions WHERE user_id = 'user123'")
+recommender.load_data()  # Force reload
+print("Reset User123:", recommender.hybrid_recommendations('user123'))  # Should fall back to popular items
+def evaluate(self, user_id, test_purchases, top_n=5):
+    recommendations = self.hybrid_recommendations(user_id, top_n)
+    hits = set(recommendations) & set(test_purchases)
+    
+    return {
+        'precision': len(hits) / top_n,
+        'recall': len(hits) / len(test_purchases) if test_purchases else 0,
+        'f1_score': 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0,
+        'coverage': len(set(recommendations)) / len(self.user_item_matrix)  # % of catalog recommended
+    }
